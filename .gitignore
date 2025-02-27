@@ -2,3 +2,9 @@
 
 venv/
 .venv/g
+
+.idea/
+__pycache__/
+data/
+*.mp3
+*.ogg

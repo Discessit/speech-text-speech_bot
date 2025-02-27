@@ -1,4 +1,5 @@
 import os
+import uuid
 import openai
 import aiofiles
 from openai import OpenAI
@@ -9,11 +10,50 @@ from settings.config import settings
 openai_client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY.get_secret_value())
 
 
+def assistant_manager():
+
+    assistant_id = None
+
+    async def ensure_assistant_exists(language: str):
+        nonlocal assistant_id
+
+        if assistant_id:
+            try:
+                await openai_client.beta.assistants.retrieve(assistant_id)
+                return assistant_id
+            except openai.NotFoundError:
+                assistant_id = None
+
+        if not assistant_id:
+            instructions = {
+                "English": "You are a personal assistant. Please answer questions in English.",
+                "Russian": "Вы персональный помощник. Пожалуйста, отвечайте на вопросы на русском языке."
+            }.get(language, "You are a personal assistant. Please answer questions in English.")
+
+            assistant = await openai_client.beta.assistants.create(
+                name="Clever guy",
+                instructions=instructions,
+                model="gpt-4-turbo",
+            )
+            assistant_id = assistant.id
+
+        return assistant_id
+
+    return ensure_assistant_exists
+
+
+ensure_assistant_exists = assistant_manager()
+
+
 async def download_voice(bot: Bot, message: Message) -> str:
     file = await bot.get_file(message.voice.file_id)
-    file_path = f"downloads/{file.file_id}.ogg"
+    unique_id = uuid.uuid4()
 
-    os.makedirs("downloads", exist_ok=True)
+    downloads_dir = os.path.join(os.path.dirname(__file__), "..", "data", "downloads")
+    os.makedirs(downloads_dir, exist_ok=True)
+
+    file_path = os.path.join(downloads_dir, f"{unique_id}.ogg")
+
     await bot.download_file(file.file_path, file_path)
 
     return file_path
@@ -29,17 +69,7 @@ async def transcribe_audio(file_path: str) -> str:
 
 
 async def get_assistant_response(prompt: str, language: str) -> str:
-    instructions = {
-        "English": "You are a personal assistant. Please answer on questions on English.",
-        "Russian": "Вы персональный помощник. Пожалуйста, отвечайте на вопросы на русском языке."
-    }
-
-    assistant = await openai_client.beta.assistants.create(
-        name="Clever guy",
-        instructions=instructions.get(language, "You are a personal assistant. "
-                                                "Please answer on questions on English."),        tools=[{"type": "code_interpreter"}],
-        model="gpt-4o",
-    )
+    assistant_id = await ensure_assistant_exists(language)
 
     thread = await openai_client.beta.threads.create()
 
@@ -49,24 +79,18 @@ async def get_assistant_response(prompt: str, language: str) -> str:
         content=f"Answer a question: {prompt}"
     )
 
-    run = await openai_client.beta.threads.runs.create(
+    run = await openai_client.beta.threads.runs.create_and_poll(
         thread_id=thread.id,
-        assistant_id=assistant.id
+        assistant_id=assistant_id
     )
 
-    while True:
-        run_status = await openai_client.beta.threads.runs.retrieve(
-            thread_id=thread.id,
-            run_id=run.id
+    if run.status == "completed":
+        messages = await openai_client.beta.threads.messages.list(
+            thread_id=thread.id
         )
-        if run_status.status == "completed":
-            break
-
-    messages = await openai_client.beta.threads.messages.list(
-        thread_id=thread.id
-    )
-
-    return messages.data[0].content[0].text.value
+        return messages.data[0].content[0].text.value
+    else:
+        raise Exception(f"Run did not complete successfully. Status: {run.status}")
 
 
 async def text_to_speech(text: str, language: str) -> str:
@@ -81,7 +105,12 @@ async def text_to_speech(text: str, language: str) -> str:
         voice=voice
     )
 
-    file_path = "output.mp3"
+    audio_responses_dir = os.path.join(os.path.dirname(__file__), "..", "data", "audio_responses")
+    os.makedirs(audio_responses_dir, exist_ok=True)
+
+    unique_id = uuid.uuid4()
+    file_path = os.path.join(audio_responses_dir, f"output_{unique_id}.mp3")
+
     async with aiofiles.open(file_path, "wb") as f:
         await f.write(response.content)
 
